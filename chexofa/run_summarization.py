@@ -14,7 +14,6 @@ from transformers import (
     AdamW,   
     SchedulerType,
     get_scheduler,
-    set_seed,
 )
 
 from transformers import OFATokenizer, OFAModel
@@ -26,21 +25,15 @@ from accelerate import (
 )
 
 from processors.dataloaders import R2DataLoader
-from eval_cxr.metrics import compute_scores #, load_gts
-from eval_cxr.utils import load_gts
+from eval_cxr.metrics import compute_scores
+from eval_cxr.utils import load_gts, postprocess_text
 
 logger = logging.getLogger(__name__)
 
-
-def postprocess_text(preds, labels):
-    preds = [pred.strip().replace("\n", "") for pred in preds]
-    labels = [label.strip().replace("\n", "") for label in labels]
-
-    # rougeLSum expects newline after each sentence
-    # preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
-    # labels = ["\n".join(nltk.sent_tokenize(label)) for label in labels]
-
-    return preds, labels
+# define text prompt depending on the target task
+TEXT_PROMPTS = {"caption" : " what does the image describe?",
+                "MLM" : ' what is the complete text of " "?',
+}
 
 
 def parse_arguments():
@@ -65,10 +58,10 @@ def parse_arguments():
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
     
     # Data loader settings
-    parser.add_argument('--dataset_name', type=str, default='mimic_cxr', choices=['iu_xray', 'mimic_cxr'],
+    parser.add_argument('--dataset_name', type=str, default='mimic_cxr', choices=['iu_xray', 'mimic_cxr', 'mimic_cxr_summarization', 'mimic_cxr_mm_summarization'],
                         help='the dataset to be used.')
     parser.add_argument('--max_seq_length', type=int, default=60, help='the maximum sequence length of the reports.')
-    parser.add_argument('--num_workers', type=int, default=2, help='the number of workers for dataloader.')
+    parser.add_argument('--num_workers', type=int, default=3, help='the number of workers for dataloader.')
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -158,7 +151,7 @@ def parse_arguments():
         "--wandb_project_name", type=str, default='idl_project', help=""
     )
     parser.add_argument(
-        "--wandb_run_name", type=str, default='test1', help=""
+        "--wandb_run_name", type=str, default='test_rsum', help=""
     )
         
     # etc.
@@ -172,15 +165,29 @@ def parse_arguments():
         "--do_eval", action="store_true", default=False, help=""
     )
     parser.add_argument(
+        "--do_eval_w_valid", action="store_true", default=False, help=""
+    )
+    parser.add_argument(
         "--do_not_save_models", action="store_true", default=False, help=""
     )
     parser.add_argument(
         "--custom_vocab", action="store_true", default=False, help=""
     )
+    parser.add_argument(
+        "--pretrain_text", action="store_true", default=False, help=""
+    )
+    parser.add_argument(
+        "--do_permutate", action="store_true", default=False, help=""
+    )
+    parser.add_argument(
+        "--use_prev", type=str, default=None, help=""
+    )
+    parser.add_argument(
+        "--n_eval_steps", type=int, default=0, help=""
+    )
+
 
     args = parser.parse_args()
-
-    
     
     return args
 
@@ -198,32 +205,48 @@ def evaluate(args,
         logger.info(f"  Instantaneous batch size per device = {args.per_device_eval_batch_size}")
 
         # Only show the progress bar once on each machine.
-        progress_bar = tqdm(range(len(eval_dataloader)), disable=not accelerator.is_local_main_process)
-
+        if args.n_eval_steps == 0:
+            progress_bar = tqdm(range(len(eval_dataloader)), disable=not accelerator.is_local_main_process)
+        else:
+            progress_bar = tqdm(range(args.n_eval_steps))
+            
         generator = sequence_generator.SequenceGenerator(
                                             tokenizer=tokenizer,
                                             beam_size=args.beam_size,
                                             max_len_b=args.max_len,
                                             min_len=args.min_len,
                                             temperature=args.temperature,
+                                            len_penalty=args.length_penalty,
                                             no_repeat_ngram_size=3,
-                                            len_penalty=1.0,
                                             )
         
         all_preds = []
         
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                input_ids = inputs_prompt.expand([len(batch[1]), -1]) # expand the text prompt to the batch size
+                ## Report Generation
+                # net_input = {"input_ids" : batch[4],
+                #              "patch_images" : batch[1],
+                #              "patch_masks"  : torch.tensor([True]),
+                #             }
+                # if args.use_prev is not None:
+                #     if 'image' in args.use_prev.lower():
+                #         net_input['patch_images_2'] = batch[6]
+
+                ## Report Summarization
                 
-                net_input = {"input_ids" : input_ids,
-                             "patch_images" : batch[1],
-                             "patch_masks"  : torch.tensor([True]),
+                net_input = {"input_ids" : batch[2],
                             }
                 
+                if args.dataset_name == "mimic_cxr_mm_summarization":
+                    net_input.update({
+                                    "patch_images" : batch[1],
+                                    "patch_masks"  : torch.tensor([True]),
+                    })
+
                 net_input = {key: inp.to(accelerator.state.device) for key, inp in net_input.items()}
                 inputs = {"net_input" : net_input
-                        }
+                }
 
                 gen_output = generator.generate([accelerator.unwrap_model(model)], inputs)
                 gen = [gen_output[i][0]["tokens"] for i in range(len(gen_output))]
@@ -246,14 +269,15 @@ def evaluate(args,
                 all_preds += [pred.strip() for pred in preds]
                 progress_bar.update(1)
 
+                if args.n_eval_steps > 0 and step == args.n_eval_steps:
+                    break
+                
         if accelerator.is_main_process:
-
-            all_gts = load_gts(args.ann_path, split=phase) #split='test'
-            # print("lengthof all_gts(ground truth from json): ", len(all_gts))
-            # print("lengthof all_preds(results)): ", len(all_preds))
+            all_gts = load_gts(args.ann_path, split=phase, target="impression")
+            if args.n_eval_steps > 0:
+                all_gts = all_gts[:len(all_preds)]
 
             all_preds, all_gts = postprocess_text(all_preds, all_gts)
-            # print("length of all_pred(results): ", len(all_preds))
 
             scores = compute_scores({i: [gt] for i, gt in enumerate(all_gts)},
                                     {i: [re] for i, re in enumerate(all_preds)}
@@ -267,11 +291,6 @@ def evaluate(args,
 def main():
     
     args = parse_arguments()
-
-    ############
-    for arg in vars(args):
-        print(f'{arg}: {getattr(args, arg)}')
-    ############
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -291,7 +310,7 @@ def main():
     if args.use_wandb and accelerator.is_main_process:
         import wandb
         ## wandb setup
-        os.environ["WANDB_API_KEY"]='e070656fc3a6e2050bddface7f88305f599b0e5d' #'a616cf33dbb6aebd17c67ceecb425c55b9176435'
+        os.environ["WANDB_API_KEY"]='e070656fc3a6e2050bddface7f88305f599b0e5d'
         os.environ["WANDB_PROJECT"]=args.wandb_project_name
         os.environ["WANDB_WATCH"]='false'
         os.environ["WANDB_START_METHOD"]='thread'
@@ -316,9 +335,8 @@ def main():
     
     # Load tokenizer and model
     logger.info("Load the tokenizer and model")
-    # tokenizer = OFATokenizer.from_pretrained(args.tokenizer_path if args.tokenizer_path is not None else args.model_name_or_path,
-    #                                          use_fast=True)
-    tokenizer = OFATokenizer.from_pretrained("/home/jiho/CMU_IntroDL/chexofa-master/transformers/src/transformers/models/ofa/ofa-base-coco")
+    tokenizer = OFATokenizer.from_pretrained(args.tokenizer_path if args.tokenizer_path is not None else args.model_name_or_path,
+                                             use_fast=True)
     pad_token_id = tokenizer.encode(str(tokenizer._pad_token), add_special_tokens=False)[0]
     model = OFAModel.from_pretrained(args.model_name_or_path, use_cache=False)
 
@@ -327,7 +345,8 @@ def main():
 
     # Load the dataloadenr
     logger.info("Load the dataloaders")
-        
+    
+    caption_prompt = tokenizer([TEXT_PROMPTS['caption']], return_tensors="pt").input_ids
     with accelerator.main_process_first():
         if args.do_train:
             train_dataloader = R2DataLoader(args, tokenizer, 
@@ -335,28 +354,29 @@ def main():
                                             shuffle=True, 
                                             batch_size=args.per_device_train_batch_size,
                                             transform=patch_resize_transform, # r2gen_transform
+                                            pt_text=args.pretrain_text,
+                                            do_permutate=args.do_permutate,
+                                            use_prev=args.use_prev,
                                 )
-
         valid_dataloader = R2DataLoader(args, tokenizer, 
                                         split='val', 
                                         shuffle=False, 
                                         batch_size=args.per_device_eval_batch_size,
                                         transform=patch_resize_transform, # r2gen_transform
+                                        use_prev=args.use_prev,
                             )
-        
+        test_split = 'val' if args.do_eval_w_valid else 'test'
         test_dataloader = R2DataLoader(args, tokenizer, 
-                                        split='test', 
+                                        split=test_split, 
                                         shuffle=False, 
                                         batch_size=args.per_device_eval_batch_size,
                                         transform=patch_resize_transform, # r2gen_transform
+                                        use_prev=args.use_prev,
                             )
-    
-    # define text prompt depending on the target task
-    txt_prompt = " what does the image describe?"
-    inputs_prompt = tokenizer([txt_prompt], return_tensors="pt").input_ids
-    
+
     if args.do_train:
         # def train():
+        print("______do train_______")
         
         ## Load the optimizer
         no_decay = ["bias", "LayerNorm.weight"]
@@ -373,27 +393,24 @@ def main():
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
         # TODO: inference with multiple GPUs
-        #################
         # Prepare everything with our `accelerator`.
-        if args.do_train:
-            model, optimizer, train_dataloader, valid_dataloader, test_dataloader = accelerator.prepare(
-                model, optimizer, train_dataloader, valid_dataloader, test_dataloader
-            )
-        else:
-            model, optimizer, test_dataloader = accelerator.prepare(
-                model, optimizer, test_dataloader
-            )
+        # if args.do_train:
+        #     model, optimizer, train_dataloader, valid_dataloader, test_dataloader = accelerator.prepare(
+        #         model, optimizer, train_dataloader, valid_dataloader, test_dataloader
+        #     )
+        # else:
+        #     model, optimizer, test_dataloader = accelerator.prepare(
+        #         model, optimizer, test_dataloader
+        #     )
         # Evaluating with single gpu 
-        ###########
-        # model, optimizer, train_dataloader = accelerator.prepare(
-        #         model, optimizer, train_dataloader
-        # )
-        ###########
-
+        
+        model, optimizer, train_dataloader = accelerator.prepare(
+                model, optimizer, train_dataloader
+        )
         
         # Scheduler and math around the number of training steps.
-        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         if args.max_train_steps is None:
+            num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
             args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         else:
             args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -427,30 +444,75 @@ def main():
         for epoch in range(args.num_train_epochs):
             model.train()
             for step, batch in enumerate(train_dataloader):
-                # outputs = model(**batch)
-                # loss = outputs.loss
+
+                ## Report Generation
+
+                # inputs = {"net_input" : {"input_ids" : batch[4],
+                #                         "patch_images" : batch[1],
+                #                         "patch_masks"  : torch.tensor([True]),
+                #                         "labels" : batch[2],
+                #                         "attention_mask" : batch[3],
+                #                         }
+                #         }
                 
-                input_ids = inputs_prompt.expand([len(batch[1]), -1]) # expand the text prompt to the batch size
+                # if args.use_prev is not None:
+                #     if 'image' in args.use_prev.lower():
+                #         inputs['net_input']['patch_images_2'] = batch[6]
+
+                # net_input = {key: inp.to(accelerator.state.device) for key, inp in inputs["net_input"].items()}
+                # outputs = model(**net_input)
                 
-                inputs = {"net_input" : {"input_ids" : input_ids,
-                                        "patch_images" : batch[1],
-                                        "patch_masks"  : torch.tensor([True]),
-                                        "labels" : batch[2],
-                                        "attention_mask" : batch[3],
+                # lm_logits = outputs[0]
+                # labels    = net_input["labels"]
+
+                # loss = loss_fct(lm_logits.view(-1, len(tokenizer)), labels.view(-1))
+
+                ## Report Summarization
+                inputs = {"net_input" : {"input_ids" : batch[2],
+                                        # "patch_masks"  : torch.tensor([True]),
+                                        "labels" : batch[4],
+                                        "attention_mask" : batch[5],
                                         }
-                        }
+                }
+
+                if args.dataset_name == "mimic_cxr_mm_summarization":
+                    inputs['net_input'].update({
+                                                "patch_images" : batch[1],
+                                                "patch_masks"  : torch.tensor([True]),
+                    })
                 
                 net_input = {key: inp.to(accelerator.state.device) for key, inp in inputs["net_input"].items()}
                 outputs = model(**net_input)
                 
                 lm_logits = outputs[0]
                 labels    = net_input["labels"]
-                
+
                 loss = loss_fct(lm_logits.view(-1, len(tokenizer)), labels.view(-1))
+                
+
+                ## Masked Language Modeling (BART Pretrainig: text infilling + sentence shuffling (planned))
+                if args.pretrain_text:
+                    # mlm_prompt = tokenizer([TEXT_PROMPTS['MLM']], return_tensors="pt").input_ids
+                    mlm_inputs = {"net_input" : 
+                                            {"input_ids" : batch[4],
+                                            "patch_masks"  : batch[5],
+                                            "labels" : batch[2],
+                                            "attention_mask" : batch[3],
+                                            }
+                            }
+                    
+                    mlm_net_input = {key: inp.to(accelerator.state.device) for key, inp in mlm_inputs["net_input"].items()}
+                    outputs = model(**mlm_net_input)
+                    
+                    lm_logits = outputs[0]
+                    labels    = mlm_net_input["labels"]
+                    
+                    loss += loss_fct(lm_logits.view(-1, len(tokenizer)), labels.view(-1))
+
+                
                 loss /= args.gradient_accumulation_steps
                 
-                # loss.backward()
-                accelerator.backward(loss)
+                accelerator.backward(loss) # loss.backward()
                 
                 if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                     optimizer.step()
@@ -479,7 +541,7 @@ def main():
                                                     model,
                                                     tokenizer,
                                                     valid_dataloader,
-                                                    inputs_prompt,
+                                                    caption_prompt,
                                                     accelerator,
                                                     phase="val"
                                                     )
@@ -493,19 +555,21 @@ def main():
                             logger.info("best checkpoint has been changed")
                             # ckpt_dir = os.path.join(args.output_dir, f'ckpt_{epoch}_' + str(step + 1))
                             os.makedirs(args.output_dir, exist_ok=True)
-                            
-                            unwrapped_model = accelerator.unwrap_model(model)
+                            #################################
+                            # lora.mark_only_lora_as_trainable(model, 'lora_sta')
+                            #################################
+                            unwrapped_model = accelerator.unwrap_model(model) 
                             unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
 
                             if accelerator.is_main_process:
                                 tokenizer.save_pretrained(args.output_dir)
                             
-                            pred_path = os.path.join(args.output_dir, f'preds.json')
+                            pred_path = os.path.join(args.output_dir, f'val_preds.json')
                             
                             with open(pred_path, 'w') as fp:
                                 json.dump(all_preds, fp)
                             
-                            with open(os.path.join(args.output_dir, 'scores.txt'), 'a') as f:
+                            with open(os.path.join(args.output_dir, 'val_scores.txt'), 'a') as f:
                                 f.write(f'ckpt_{epoch}_' + str(step + 1) + ": " + str(scores))
                         
                             if args.use_wandb:
@@ -519,22 +583,24 @@ def main():
     
     # Evaluate!
     if args.do_eval:
+        print("______do evlal_______")
         if args.do_train:
+            print("args do train")
             logger.info("Load the tokenizer and model")
             tokenizer = OFATokenizer.from_pretrained(args.tokenizer_path if args.tokenizer_path is not None else args.output_dir,
                                                     use_fast=True)
             model = OFAModel.from_pretrained(args.output_dir, use_cache=False)
-            model = accelerator.prepare(model)
-
+        
+        model = accelerator.prepare(model)
         model.eval()
         if accelerator.is_main_process:
             all_preds, scores = evaluate(args,
                                         model,
                                         tokenizer,
                                         test_dataloader, 
-                                        inputs_prompt,
+                                        caption_prompt,
                                         accelerator,
-                                        phase="test"
+                                        phase="val" if args.do_eval_w_valid else "test" 
                                         )
 
             logger.info(f"Save the final model into {args.output_dir}")
@@ -543,7 +609,7 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
             out_path = os.path.join(args.output_dir, 'preds.json')
             
-            if not args.do_not_save_models:
+            if not args.do_not_save_models or not args.do_train:
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.save_pretrained(args.output_dir, save_function=accelerator.save)
 
