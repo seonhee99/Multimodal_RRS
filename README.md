@@ -16,7 +16,8 @@ large language models over pre-training and fine-tuning approaches because of da
 This work was motivated by a course project (11-785 Introduction to Deep Learning) by Professor Bhiksha Raj. <br>
 We are currently working towards publishing this work in Spring 2024.
 
-The directory above details each of the three currently implemented models:
+The directory above details each of the three currently implemented models: <br>
+NOTE: the files in these directories correspond to modified files from the main model directories on Github or Hugging Face
 - CheXOFA with standard and Low Rank Adaptation (LoRA) fine-tuning methodologies
 - Flamingo
 - Instruct-BLIP with LLaMA-7b
